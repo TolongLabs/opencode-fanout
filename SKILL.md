@@ -45,8 +45,8 @@ opencode models | grep -iE "glm|deepseek|gemini"            # everything else, 4
 ```
 
 The free list rotates: stealth and preview models arrive and leave without notice. Read it every session. A listed
-model can still be dead (`has been deprecated`, `Model is unavailable`, exit 1), so dispatch one worker on a new model
-before fanning out six.
+model can still be dead (`has been deprecated`, `Model is unavailable`, exit 1), so dispatch one worker on any model
+that has not completed a run this session before fanning out six.
 
 **3. Ask the user which model to use, unless they already named one.** Use `AskUserQuestion`, one question, with the
 default first and marked. Model choice is cost, and it is the user's cost. A model the user named earlier in the same
@@ -65,11 +65,16 @@ State the chosen id back before dispatching.
 within OpenCode". Run them through `opencode run`; never route them through a proxy or another harness.
 
 **4. Point the title model at a free model.** OpenCode names each session with a separate small model, paid by default.
-On an account with no credit it logs `Insufficient account funds` on every run. Export this once per shell:
+On an account with no credit it logs `Insufficient account funds` on every run. Set it inside every worker command,
+since shell state does not carry between Bash calls; the templates below already do:
 
 ```bash
-export OPENCODE_CONFIG_CONTENT='{"small_model":"opencode/space-bunny-free"}'
+OPENCODE_CONFIG_CONTENT='{"small_model":"opencode/space-bunny-free"}'
 ```
+
+**5. Isolate the repo.** Put workers on a branch or a separate `git worktree` before dispatch. A bad run then costs
+`git checkout -- . && git clean -fd`, not a reconstruction. A branch does not isolate parallel workers from each
+other; distinct output paths do.
 
 ---
 
@@ -98,11 +103,10 @@ idea why. The log is the only evidence you will have.
 and stay that way indefinitely. Observed: fifteen minutes on a four-file brief with nothing written. `timeout 900`
 turns that into an exit code you will be notified about instead of a wait you have to notice.
 
-```bash
-timeout 900 opencode run --model "$MODEL" --dir "$PWD" "$BRIEF" < /dev/null > "$LOG" 2>&1; echo "exit=$?"
-```
+Size the timeout to the brief: `300` for a file or two, `900` for a large batch. The timeout is your stall detector.
 
-Exit 124 means the timeout fired. Check `git status --porcelain` in `--dir` before deciding whether anything landed.
+Exit 124 means the timeout fired. Check `git status --porcelain --untracked-files=all` in `--dir` before deciding
+whether anything landed. Plain `--porcelain` shows a new directory as one line and hides stray files inside it.
 
 **`--dir` is a hard boundary.** OpenCode auto-rejects reads outside it - `permission requested: external_directory ...
 auto-rejecting` - and then **exits 0 anyway** having done nothing. Copy every input inside the directory first, and
@@ -113,30 +117,29 @@ delete it afterwards.
 Launch each with `run_in_background: true`, one per call in a single message so they start together. Give each its own
 log file and its own output paths. **Never let two workers write the same file.**
 
+Write each brief to its own file first (see Writing The Brief), then launch one worker per call:
+
 ```bash
-# One worker. Repeat per chunk, each backgrounded, each with a distinct LOG and target.
-LOG=<scratch>/oc-<chunk>.log
-opencode run --model "$MODEL" --dir "$PWD" "$(cat <<'BRIEF'
-...
-BRIEF
-)" < /dev/null > "$LOG" 2>&1
+# One worker. Repeat per chunk, each backgrounded, each with a distinct brief, log and target.
+CHUNK=<chunk>; S=<scratch>; START=$(date +%s)
+OPENCODE_CONFIG_CONTENT='{"small_model":"opencode/space-bunny-free"}' \
+  timeout 300 opencode run --model "$MODEL" --dir "$PWD" "$(cat "$S/brief-$CHUNK.md")" \
+  < /dev/null > "$S/oc-$CHUNK.log" 2>&1
+echo "$CHUNK exit=$? $(( $(date +%s) - START ))s"
 ```
 
-Wait for the task notifications. Do not poll, and do not start reviewing chunk 1 while chunk 2 is still writing to a
-file you are reading.
+Wait for the task notifications; each worker's `timeout` guarantees one arrives. Review a chunk only after its own
+notification, never while another worker may still be writing a file you are reading.
 
 ### Stalls
 
-A healthy run writes to its log within the first minute or two. If the log is still 0 bytes **and** `git status
---porcelain` in `--dir` is empty after three minutes, the worker is stalled, not slow. Kill it and either re-dispatch
-once with a shorter brief or do the work yourself; a brief that already contains the exact code is faster to apply
-than to wait on.
+A stalled worker hangs with the process alive, the log at 0 bytes and no file touched. Its `timeout` ends it as exit
+124. Then re-dispatch once with a shorter brief, or do the work yourself; a brief that already contains the exact
+code is faster to apply than to wait on.
 
-Kill by executable name, never by pattern: `pkill -x opencode`. `pkill -f "opencode run"` also matches the shell that
-is running your own command, because the brief is in its argument list, and kills your session's command (exit 144).
-
-Do not put a repo you care about under a worker without a branch or a separate `git worktree`: a stalled or half-done
-run then costs one `git checkout -- .`, not a reconstruction.
+To end one worker early, stop its background task. `pkill -x opencode` ends every worker at once. `pkill -f "opencode
+run"` also matches the shell running your own command, because the brief is in its argument list, and kills it
+(exit 144).
 
 ### Sequential
 
@@ -152,8 +155,8 @@ One log per stage, `&&` between them, so a failure stops the chain instead of fe
 A worker prompt is a work order, not a chat message. Six things, and the first two are what actually prevent damage:
 
 1. **Name every file to create, and say "and nothing else".** Without it you get stray scratch files in the repo
-2. **State the inputs as paths inside `--dir`**, and say "read them, never mention their paths in your output" if the
-   output is committed - otherwise machine paths leak into the deliverable
+2. **State the inputs as paths inside `--dir`**, and say "never write absolute or machine paths in your output" if
+   the output is committed. Paths the source names on purpose, such as `$CLIPROXY_DIR`, stay
 3. **Give the output format concretely.** Heading levels, table columns, casing. "Well structured" produces whatever the
    model likes today
 4. **Carry the house rules in.** Line width, casing, tone, no emoji. The worker has never read your `AGENTS.md`
@@ -161,7 +164,15 @@ A worker prompt is a work order, not a chat message. Six things, and the first t
    pass over a source record is worse than no pass
 6. **Ask for a short report** - what it wrote, what it could not do, what it guessed at
 
-Use a quoted heredoc so `$`, backticks and quotes survive the shell.
+Write each brief to a file with a quoted heredoc, so `$`, backticks and quotes survive the shell. For briefs that
+differ only by chunk, put a placeholder in the heredoc and substitute it afterwards:
+
+```bash
+cat > "$S/brief-template.md" <<'BRIEF'
+Read src/@CHUNK@.md and write summaries/@CHUNK@.md, and nothing else. ...
+BRIEF
+for c in a b c; do sed "s/@CHUNK@/$c/g" "$S/brief-template.md" > "$S/brief-$c.md"; done
+```
 
 ---
 
@@ -176,7 +187,9 @@ Check, in this order:
 ls -la <expected outputs>                       # do they exist, are they non-trivial
 grep -c "<structural marker>" <output>          # right shape, right count
 grep -rn "/home/\|C:\\\\Users\|/tmp/" <output>  # no machine paths leaked
-tail -20 "$LOG"                                 # what it said it did
+tail -c1 <output> | od -c                       # ends in \n, if the brief asked for it
+git status --porcelain --untracked-files=all    # only the expected files changed
+sed 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -20      # what it said it did, colour codes stripped
 ```
 
 Then **read the parts that carry risk.** In practice a good worker still fabricates a plausible column, invents a
@@ -196,13 +209,13 @@ Fix small defects yourself. Re-dispatch only if a chunk is broadly wrong, with t
 | `free tier can only be used from within OpenCode` | A free model was called outside `opencode run`. Dispatch it through the CLI       |
 | `Insufficient account funds`                   | Paid model on a $0 Zen balance, or the title model. Pick a free model; see step 4  |
 | `An active OpenCode Go subscription is required` | An `opencode-go/*` model without Go. Use a free Zen model instead                |
-| Empty log, process alive, no files, for minutes | Stalled. `pkill -x opencode`, then re-dispatch shorter or apply the brief yourself   |
-| Your own shell died with exit 144              | You ran `pkill -f "opencode run"`, which matched your command line. Use `pkill -x`  |
-| Exit 124                                       | `timeout` fired. Check `git status --porcelain` before assuming nothing landed        |
+| Empty log, process alive, no files, for minutes | Stalled. Its `timeout` ends it; then re-dispatch shorter or apply the brief yourself |
+| Your own shell died with exit 144              | You ran `pkill -f "opencode run"`, which matched your command line. Stop the task   |
+| Exit 124                                       | `timeout` fired. Check `git status --porcelain --untracked-files=all` first           |
 | Empty log, process gone                        | Killed. Never diagnose from a `\| tail` pipe - redirect to a file from the start     |
 | Output has an invented column or section       | The brief left the format open. Specify columns and headings literally               |
 | Source text summarised instead of transcribed  | Say "transcribe, do not summarise" and name what must survive verbatim               |
-| Stray files in the repo                        | The brief did not say "and nothing else". `git status` after every run               |
+| Stray files in the repo                        | The brief did not say "and nothing else". `git status --untracked-files=all` per run  |
 | Model id rejected                              | Catalogue drift. Re-run `opencode models` rather than retrying the same id           |
 
 ---
