@@ -44,7 +44,9 @@ opencode models opencode | grep -E -- '-free$|big-pickle'   # the free Zen model
 opencode models | grep -iE "glm|deepseek|gemini"            # everything else, 400+ entries
 ```
 
-The free list rotates: stealth and preview models arrive and leave without notice. Read it every session.
+The free list rotates: stealth and preview models arrive and leave without notice. Read it every session. A listed
+model can still be dead (`has been deprecated`, `Model is unavailable`, exit 1), so dispatch one worker on a new model
+before fanning out six.
 
 **3. Ask the user which model to use, unless they already named one.** Use `AskUserQuestion`, one question, with the
 default first and marked. Model choice is cost, and it is the user's cost. A model the user named earlier in the same
